@@ -2,12 +2,20 @@ from fastapi import FastAPI, UploadFile, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import re
+import os
+import json
+import time
+import logging
+import shutil
 import PyPDF2
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
 from typing import List
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
 
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 
 # Add CORS middleware to allow requests from any origin
 app.add_middleware(
@@ -18,11 +26,22 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers.
 )
 
+# Initialize scheduler
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+UPLOAD_FOLDER = "./uploaded_files/"
 model = SentenceTransformer('all-MiniLM-L6-v2')
 chunks = []
 embeddings = None
 
 # Utility functions
+def schedule_file_deletion(filename: str, interval_hours: int = 24):
+    """Schedules a file to be deleted after a given interval in hours."""
+    delete_time = datetime.now() + timedelta(hours=interval_hours)
+    scheduler.add_job(func=os.remove, trigger="date", run_date=delete_time, args=[filename])
+    logging.info(f"Scheduled deletion for file '{filename}' at {delete_time}")
+
 def extract_text_from_pdf(pdf_path):
     """Extracts text from a PDF file."""
     text = ""
@@ -74,25 +93,33 @@ def answer_question(question, chunks, embeddings, model, top_k=3):
 # FastAPI endpoints
 @app.post("/upload_pdf")
 async def upload_pdf(file: UploadFile):
-    global chunks, embeddings
-    if file.content_type not in ["application/pdf", "application/octet-stream"] or \
-       (file.content_type == "application/octet-stream" and not file.filename.endswith(".pdf")):
-        return JSONResponse(content={"error": "Invalid file type. Only PDFs are accepted."}, status_code=400)
+    try:
+        global chunks, embeddings
+        if file.content_type not in ["application/pdf", "application/octet-stream"] or \
+        (file.content_type == "application/octet-stream" and not file.filename.endswith(".pdf")):
+            return JSONResponse(content={"error": "Invalid file type. Only PDFs are accepted."}, status_code=400)
 
-    # Save the PDF file and extract its text
-    file_location = f"uploaded_files/{file.filename}"
-    with open(file_location, "wb") as f:
-        f.write(await file.read())
-    
-    # Extract and process text from the PDF
-    raw_text = extract_text_from_pdf(file_location)
-    clean_text = preprocess_text(raw_text)
-    text_chunks = chunk_text(clean_text)
-    
-    # Build the vector store with embeddings
-    chunks, embeddings = build_vector_store(text_chunks, model)
-    
-    return {"message": "File uploaded and text processed successfully"}
+        logging.info(f"File {file.filename} uploaded and text extracted successfully.")
+        # Save the PDF file and extract its text
+        file_location = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(file_location, "wb") as f:
+            f.write(await file.read())
+
+        # Schedule file deletion after 24 hours
+        schedule_file_deletion(file_location)
+
+        # Extract and process text from the PDF
+        raw_text = extract_text_from_pdf(file_location)
+        clean_text = preprocess_text(raw_text)
+        text_chunks = chunk_text(clean_text)
+        
+        # Build the vector store with embeddings
+        chunks, embeddings = build_vector_store(text_chunks, model)
+        
+        return {"message": "File uploaded and text processed successfully"}
+    except Exception as e:
+        logging.error(f"Error processing PDF upload: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/answer")
 async def get_answer(request: Request):
@@ -100,6 +127,7 @@ async def get_answer(request: Request):
     try:
         data = await request.json()
         question = data.get("question")
+        logging.info(f"Received question: {question}")
         if not question:
             raise HTTPException(status_code=422, detail="Missing 'question' field")
         
@@ -108,6 +136,7 @@ async def get_answer(request: Request):
         
         # Generate the answer
         response = answer_question(question, chunks, embeddings, model)
+        logging.info(f"Answer: {response}")
         return {"answer": response}
 
     except Exception as e:
